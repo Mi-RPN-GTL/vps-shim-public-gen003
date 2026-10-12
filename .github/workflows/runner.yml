@@ -642,8 +642,10 @@ jobs:
           GO_FILE="/home/runner/shim/repo/vps-shim/state/go_standby.json"
           SPAWN_FROZEN_DONE=0
           STANDBY_START_EPOCH=$(date +%s)
+          echo "$STANDBY_START_EPOCH" > /home/runner/shim/home_sync_fast_after 2>/dev/null || true
           LAST_STALE_LOGGED=""
           LAST_HB_AT=0
+          LAST_PULL_AT=0
           # Standby milestones also relay to the private repo so they survive if this VM dies.
           _sdiag() {
             local ph="$1" lv="$2" dt="$3" args=() kv
@@ -685,12 +687,11 @@ jobs:
               echo "promoted=0" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            sleep 15
+            sleep 4
             # Real elapsed time: each loop also runs git_pull.sh, so counting 15s per pass undercounts.
             WAITED=$(( $(date +%s) - STANDBY_START_EPOCH ))
             if [ $((WAITED - LAST_HB_AT)) -ge 60 ]; then LAST_HB_AT=$WAITED; _standby_hb; _sdiag standby_wait_loop info "still waiting for go-file, waited=${WAITED}s"; fi
-            bash /home/runner/shim/repo/vps-shim/scripts/git_pull.sh > /dev/null 2>&1 || true
-            python3 /home/runner/shim/repo/vps-shim/telegram/go_signal.py fetch --out "$GO_FILE" >/dev/null 2>&1 || true
+            if [ $((WAITED - LAST_PULL_AT)) -ge 60 ]; then LAST_PULL_AT=$WAITED; bash /home/runner/shim/repo/vps-shim/scripts/git_pull.sh > /dev/null 2>&1 || true; fi
 
             if [ "$SPAWN_FROZEN_DONE" -eq 0 ]; then
               SPAWN_FROZEN_DONE=1
@@ -763,45 +764,7 @@ jobs:
               python3 /tmp/freeze_spawn.py
             fi
 
-            cat > /tmp/resume_swapped.py <<'PYEOF'
-                import sys
-                sys.path.insert(0, '/home/runner/shim/repo/vps-shim/telegram')
-                import launched
-                manifest = launched.read_handoff_manifest()
-                go_entries = {k: v for k, v in manifest.items() if v.get('phase') == 'go'}
-                if go_entries:
-                    own_frozen = {r['launch_id']: r for r in launched.list_launched() if r.get('spawn_mode') == 'frozen'}
-                    for outgoing_id, entry in go_entries.items():
-                        standby_id = entry.get('standby_launch_id')
-                        rec = own_frozen.get(standby_id)
-                        if rec is None:
-                            continue
-                        if launched.is_alive(rec['pid']) and launched.is_paused(rec['pid']):
-                            import subprocess as _sp
-                            _sp.run(['python3', '/home/runner/shim/repo/vps-shim/scripts/home_sync.py', '--catchup'], timeout=1000, check=False, env=dict(__import__('os').environ, SHIM_ROOT='/home/runner/shim'))
-                            resumed_ok = launched.resume(standby_id)
-                            print(f'PHASE: resumed swapped-in replica (launch_id {standby_id}, for outgoing {outgoing_id}), ok={resumed_ok}')
-                            import handoff_diag as _hd
-                            _hd.emit('standby_go_seen', f'go seen for {outgoing_id}', side='standby', trace=True)
-                            _hd.emit('standby_resume_result', f'resume ok={resumed_ok} for {standby_id}', side='standby', level='ok' if resumed_ok else 'fail', trace=True)
-                            if resumed_ok:
-                                # v293: hand the outgoing launch's identity to the replica
-                                # (lineage slot + supersede the old record) BEFORE anything
-                                # else, so it is never a second, 'unlinked' launch.
-                                try:
-                                    launched.adopt_swapped_replica(outgoing_id, standby_id)
-                                except Exception as _e:
-                                    print(f'WARNING: adopt_swapped_replica failed for {standby_id}: {_e}')
-                                # Bridge handoff: tell the outgoing VM its
-                                # replacement is confirmed live BEFORE it
-                                # kills its own (still-paused, not dead)
-                                # copy -- see swap_or_fallback_all's
-                                # post-"go" wait for this phase.
-                                launched.write_handoff_entry(outgoing_id, phase='standby_live')
-                                _hd.emit('standby_live_written', f'standby_live written for {outgoing_id}', side='standby', level='ok', trace=True)
-          PYEOF
-            sed -i 's/^      //' /tmp/resume_swapped.py
-            python3 /tmp/resume_swapped.py
+            python3 /home/runner/shim/repo/vps-shim/telegram/resume_swapped.py "$GO_FILE" || true
           done
           echo "go-file found after ${WAITED}s -- promoting"
           _sdiag standby_promoted ok "go-file found after ${WAITED}s, promoting" go_from_run_id="${GO_FROM:-}" go_cycle_id="${GO_CYC:-}" go_age_s="${GO_AGE:-}" waited_s="$WAITED"
@@ -828,6 +791,7 @@ jobs:
           # nobody ever promote -- exactly the "shift the problem"
           # failure mode this whole redesign is trying to avoid.
           RESULT=""
+          CLAIM_T0=$(date +%s)
           for attempt in 1 2 3 4 5; do
             if OUT=$(bash /home/runner/shim/repo/vps-shim/scripts/claim_standby.sh \
                 "${{ steps.wait.outputs.go_epoch }}" 2>&1); then
@@ -839,7 +803,7 @@ jobs:
               echo "claim attempt ${attempt} failed operationally, retrying..."
               sleep $((attempt * 5))
           done
-          python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py emit --phase standby_claim --level info --detail "claim result=${RESULT:-inconclusive}" --side standby --trace >/dev/null 2>&1 || true
+          python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py emit --phase standby_claim --level info --detail "claim result=${RESULT:-inconclusive} attempts=${attempt:-0} elapsed=$(( $(date +%s) - CLAIM_T0 ))s" --side standby --trace >/dev/null 2>&1 || true
           if [ "$RESULT" = "WON" ]; then
             echo "won=1" >> "$GITHUB_OUTPUT"
           elif [ "$RESULT" = "LOST" ]; then
